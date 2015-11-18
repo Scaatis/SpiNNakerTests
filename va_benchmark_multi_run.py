@@ -8,14 +8,29 @@ Simulator is hardcoded as spiNNaker, benchmark as CUBA.
 """
 
 import os
-import socket
 from math import *
 
-import pyNN.spiNNaker as Frontend
-from pyNN.utility import Timer
+import pyNN.spiNNaker as sim
 from pyNN.random import NumpyRNG, RandomDistribution
 
-timer = Timer()
+import matplotlib.pyplot as plt
+
+from itertools import count, takewhile, ifilter, islice
+
+import sys
+mode = "spikes"
+if len(sys.argv) > 1:
+    if len(sys.argv) > 2 or sys.argv[1] == "help" or sys.argv[1] not in ("v", "spikes"):
+        print "Usage: python dummy_net_multi_run.py [v|spikes|help]"
+        print "v: plot voltage"
+        print "spikes: plot spikes (default)"
+        print "help: print this help and exit"
+        if sys.argv[1] == "help":
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    elif sys.argv[1] == "v":
+        mode = "v"
 
 # === Define parameters ========================================================
 
@@ -29,10 +44,9 @@ pconn    = 0.02  # connection probability
 stim_dur = 50.   # (ms) duration of random stimulation
 rate     = 100.  # (Hz) frequency of the random stimulation
 
-dt       = 0.1   # (ms) simulation resolution
-tstop    = 30  # (ms) total simulaton duration
-tstep    = 10    # (ms) simulation step duration
-delay    = 0.2
+dt       = 1.0   # (ms) simulation resolution
+tstop    = 100  # (ms) total simulaton duration
+delay    = 2.0
 
 # Cell parameters
 area     = 20000. # (µm²)
@@ -63,7 +77,7 @@ Rm    = 1e-6/(g_leak*area)            # membrane resistance in MΩ
 assert tau_m == cm*Rm                 # just to check
 n_exc = int(round((n*r_ei/(1+r_ei)))) # number of excitatory cells   
 n_inh = n - n_exc                     # number of inhibitory cells
-celltype = Frontend.IF_curr_exp
+celltype = sim.IF_curr_exp
 w_exc = 1e-3*Gexc*(Erev_exc - v_mean) # (nA) weight of excitatory synapses
 w_inh = 1e-3*Ginh*(Erev_inh - v_mean) # (nA)
 assert w_exc > 0; assert w_inh < 0
@@ -73,10 +87,7 @@ assert w_exc > 0; assert w_inh < 0
 extra = {'threads' : threads,
          'label': 'VA'}
 
-node_id = Frontend.setup(timestep=dt, min_delay=delay, max_delay=delay, **extra)
-
-host_name = socket.gethostname()
-print "Host #%d is on %s" % (node_id+1, host_name)
+node_id = sim.setup(timestep=dt, min_delay=delay, max_delay=delay, **extra)
 
 print "%s Initialising the simulator with %d thread(s)..." % (node_id, extra['threads'])
     
@@ -84,14 +95,12 @@ cell_params = {
     'tau_m'      : tau_m,    'tau_syn_E'  : tau_exc,  'tau_syn_I'  : tau_inh,
     'v_rest'     : E_leak,   'v_reset'    : v_reset,  'v_thresh'   : v_thresh,
     'cm'         : cm,       'tau_refrac' : t_refrac}
-    
-timer.start()
 
 print "%s Creating cell populations..." % node_id
-exc_cells = Frontend.Population(n_exc, celltype, cell_params,
-	label="Excitatory_Cells")
-inh_cells = Frontend.Population(n_inh, celltype, cell_params,
-	label="Inhibitory_Cells")
+exc_cells = sim.Population(n_exc, celltype, cell_params,
+    label="Excitatory_Cells")
+inh_cells = sim.Population(n_inh, celltype, cell_params,
+    label="Inhibitory_Cells")
 
 print "%s Initialising membrane potential to random values..." % node_id
 rng = NumpyRNG(seed=rngseed, parallel_safe=parallel_safe)
@@ -100,46 +109,65 @@ exc_cells.initialize('v', uniformDistr)
 inh_cells.initialize('v', uniformDistr)
 
 print "%s Connecting populations..." % node_id
-exc_conn = Frontend.FixedProbabilityConnector(pconn, weights=w_exc,
-	delays=delay)
-inh_conn = Frontend.FixedProbabilityConnector(pconn, weights=w_inh,
-	delays=delay)
+exc_conn = sim.FixedProbabilityConnector(pconn, weights=w_exc,
+    delays=delay)
+inh_conn = sim.FixedProbabilityConnector(pconn, weights=w_inh,
+    delays=delay)
 
 connections={}
-connections['e2e'] = Frontend.Projection(exc_cells, exc_cells, exc_conn,
-	target='excitatory', rng=rng)
-connections['e2i'] = Frontend.Projection(exc_cells, inh_cells, exc_conn,
-	target='excitatory', rng=rng)
-connections['i2e'] = Frontend.Projection(inh_cells, exc_cells, inh_conn,
-	target='inhibitory', rng=rng)
-connections['i2i'] = Frontend.Projection(inh_cells, inh_cells, inh_conn,
-	target='inhibitory', rng=rng)
+connections['e2e'] = sim.Projection(exc_cells, exc_cells, exc_conn,
+    target='excitatory', rng=rng)
+connections['e2i'] = sim.Projection(exc_cells, inh_cells, exc_conn,
+    target='excitatory', rng=rng)
+connections['i2e'] = sim.Projection(inh_cells, exc_cells, inh_conn,
+    target='inhibitory', rng=rng)
+connections['i2i'] = sim.Projection(inh_cells, inh_cells, inh_conn,
+    target='inhibitory', rng=rng)
 
 
 # === Setup recording ==========================================================
 print "%s Setting up recording..." % node_id
-exc_cells.record()
-inh_cells.record()
-#exc_cells[[0, 1]].record_v()
-
-buildCPUTime = timer.diff()
+if mode == "spikes":
+    #exc_cells.record()
+    inh_cells.record()
+else:
+    exc_cells.record_v()
+    inh_cells.record_v()
 
 # === Run simulation ===========================================================
 print "%d Running simulation..." % node_id
 
-for i in range(tstop // tstep):
-	print "Starting run %d" % (i+1)
-	Frontend.run(tstep)
+plt.figure()
+plt.xlabel("Time (ms)")
+if mode == "spikes":
+    plt.ylabel("Neuron index")
+else:
+    plt.ylabel("Voltage")
+plt.show(block=False)
 
-	simCPUTime = timer.diff()
+running = True
+total_run_time = 0
 
-	exc_spikes = exc_cells.getSpikes()
-	inh_spikes = inh_cells.getSpikes()
+while running:
+    sim.run(tstop)
+    total_run_time += tstop
 
-	writeCPUTime = timer.diff()
+    plt.xlim(max(0, total_run_time - 5*tstop), total_run_time)
+    if mode == "spikes":
+        plt.ylim(-1, n_inh + 1)
+        all_spikes = inh_cells.getSpikes()
+        spikes = list(ifilter(lambda x: x[1] > total_run_time - tstop, all_spikes))
+        plt.plot([i[1] for i in spikes], [i[0] for i in spikes], "bo", markersize=3)
+    else:
+        plt.ylim(v_reset - 2, v_thresh + 2)
+        voltages = list(ifilter(lambda x: x[0] == 5 and x[1] >= total_run_time - tstop,
+            reversed(exc_cells.get_v())))
+        plt.plot([i[1] for i in voltages], [i[2] for i in voltages], "b-", markersize=1)
 
-	print "Simulating took %g ms" % simCPUTime
-	print "Reading spikes took %g ms" % writeCPUTime
-	print "A total of %d spikes was read" % (len(exc_spikes) + len(inh_spikes))
+    plt.draw()
+    plt.pause(0.001)
 
-Frontend.end()
+    if not plt.get_fignums():
+        running = False
+
+sim.end()
